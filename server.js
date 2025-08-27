@@ -2,7 +2,7 @@
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
-const mysql = require("mysql2");
+const sqlite3 = require("sqlite3").verbose();
 const path = require("path");
 
 const app = express();
@@ -11,12 +11,26 @@ app.use(bodyParser.json());
 // Serve static files (for HTML, CSS, JS)
 app.use(express.static(path.join(__dirname, "public")));
 
-// Database connection
-const db = mysql.createConnection({
-  host: "localhost",
-  user: "root",
-  password: "",  // change if needed
-  database: "payments"
+// SQLite database connection (local file)
+const db = new sqlite3.Database("./payments.db", (err) => {
+  if (err) return console.error("SQLite DB connection failed:", err.message);
+  console.log("SQLite DB connected successfully!");
+});
+
+// Create deposits table if it doesn't exist
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS deposits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      phone_number TEXT,
+      amount REAL,
+      status TEXT DEFAULT 'pending',
+      transaction_id TEXT,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  console.log("Deposits table ready!");
 });
 
 // Flutterwave secret key
@@ -32,44 +46,46 @@ app.post("/deposit", (req, res) => {
   const { user_id, amount, phone_number } = req.body;
 
   // Insert pending deposit
-  db.query(
-    "INSERT INTO deposits (user_id, phone_number, amount) VALUES (?, ?, ?)",
+  db.run(
+    `INSERT INTO deposits (user_id, phone_number, amount) VALUES (?, ?, ?)`,
     [user_id, phone_number, amount],
-    async (err, result) => {
+    function (err) {
       if (err) return res.status(500).send(err);
 
-      const deposit_id = result.insertId;
+      const deposit_id = this.lastID;
 
-      try {
-        // Call Flutterwave API
-        const response = await axios.post(
-          "https://api.flutterwave.com/v3/charges?type=mobile_money_rwanda",
-          {
-            tx_ref: "tx_" + Date.now(),
-            amount: amount,
-            currency: "RWF",
-            payment_type: "mobilemoneyrwanda",
-            order_id: deposit_id,
-            redirect_url: "https://yourdomain.com/webhook",
-            customer: {
-              email: "user@mail.com",
-              phonenumber: phone_number,
-              name: "Deposit User"
+      (async () => {
+        try {
+          // Call Flutterwave API
+          const response = await axios.post(
+            "https://api.flutterwave.com/v3/charges?type=mobile_money_rwanda",
+            {
+              tx_ref: "tx_" + Date.now(),
+              amount: amount,
+              currency: "RWF",
+              payment_type: "mobilemoneyrwanda",
+              order_id: deposit_id,
+              redirect_url: "https://yourdomain.com/webhook",
+              customer: {
+                email: "user@mail.com",
+                phonenumber: phone_number,
+                name: "Deposit User"
+              }
+            },
+            {
+              headers: {
+                Authorization: `Bearer ${FLW_SECRET_KEY}`,
+                "Content-Type": "application/json"
+              }
             }
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${FLW_SECRET_KEY}`,
-              "Content-Type": "application/json"
-            }
-          }
-        );
+          );
 
-        res.json(response.data);
-      } catch (error) {
-        console.error(error.response?.data || error.message);
-        res.status(500).json({ error: "Flutterwave request failed" });
-      }
+          res.json(response.data);
+        } catch (error) {
+          console.error(error.response?.data || error.message);
+          res.status(500).json({ error: "Flutterwave request failed" });
+        }
+      })();
     }
   );
 });
@@ -85,16 +101,16 @@ app.post("/webhook", (req, res) => {
   const order_id = data.order_id;
 
   if (tx_status === "successful") {
-    db.query(
-      "UPDATE deposits SET status='successful', transaction_id=? WHERE id=?",
+    db.run(
+      `UPDATE deposits SET status='successful', transaction_id=? WHERE id=?`,
       [tx_id, order_id],
       (err) => {
         if (err) console.error(err);
       }
     );
   } else {
-    db.query(
-      "UPDATE deposits SET status='failed' WHERE id=?",
+    db.run(
+      `UPDATE deposits SET status='failed' WHERE id=?`,
       [order_id],
       (err) => {
         if (err) console.error(err);
